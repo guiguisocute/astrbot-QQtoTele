@@ -1,0 +1,554 @@
+import asyncio
+import os
+import re
+import tempfile
+import time
+import uuid
+import urllib.request
+from datetime import datetime, time as dtime
+from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult, filter
+import astrbot.api.message_components as Comp
+from astrbot.api.star import Context, Star, register
+from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
+
+from .storage.local_cache import LocalCache
+
+
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.0")
+class SowingDiscord(Star):
+    def __init__(self, context: Context, config: dict | None = None):
+        super().__init__(context)
+        config = config or {}
+
+        self.instance_id = str(uuid.uuid4())[:8]
+
+        self.banshi_interval = int(config.get("banshi_interval", 600))
+        self.banshi_cache_seconds = int(config.get("banshi_cache_seconds", 3600))
+        self.cooldown_day_seconds = int(config.get("banshi_cooldown_day_seconds", 600))
+        self.cooldown_night_seconds = int(
+            config.get("banshi_cooldown_night_seconds", 3600)
+        )
+        self.cooldown_day_start_str = config.get("banshi_cooldown_day_start", "09:00")
+        self.cooldown_night_start_str = config.get(
+            "banshi_cooldown_night_start", "01:00"
+        )
+        self._day_start = self._parse_time_str(self.cooldown_day_start_str, dtime(9, 0))
+        self._night_start = self._parse_time_str(
+            self.cooldown_night_start_str, dtime(1, 0)
+        )
+
+        self.banshi_group_list = self._normalize_int_list(
+            config.get("banshi_group_list")
+        )
+        self.banshi_target_list = self._normalize_int_list(
+            config.get("banshi_target_list")
+        )
+        self.telegram_target_unified_origins = self._normalize_str_list(
+            config.get("telegram_target_unified_origins")
+        )
+
+        self.block_source_messages = bool(config.get("block_source_messages", False))
+        self.banshi_waiting_time = int(config.get("banshi_waiting_time", 1))
+        self.telegram_upload_files = bool(config.get("telegram_upload_files", True))
+        self.telegram_upload_max_mb = int(config.get("telegram_upload_max_mb", 10))
+        self.telegram_upload_max_bytes = (
+            max(1, self.telegram_upload_max_mb) * 1024 * 1024
+        )
+        self.local_cache = LocalCache(
+            max_age_seconds=self.banshi_cache_seconds,
+            waiting_time=self.banshi_waiting_time,
+        )
+
+        self.forward_lock = asyncio.Lock()
+        self._forward_task = None
+
+        logger.info(f"[QQ2TG][ID:{self.instance_id}] 插件初始化完成")
+        logger.info(f"[QQ2TG][ID:{self.instance_id}] 来源群: {self.banshi_group_list}")
+        logger.info(
+            f"[QQ2TG][ID:{self.instance_id}] Telegram 目标: {self.telegram_target_unified_origins}"
+        )
+
+    @staticmethod
+    def _normalize_int_list(raw):
+        if isinstance(raw, (int, str)):
+            return [int(raw)] if str(raw).isdigit() else []
+        if isinstance(raw, list):
+            return [int(x) for x in raw if str(x).isdigit()]
+        return []
+
+    @staticmethod
+    def _normalize_str_list(raw):
+        if isinstance(raw, str):
+            return [raw.strip()] if raw.strip() else []
+        if isinstance(raw, list):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        return []
+
+    def _parse_time_str(self, time_str: str, fallback: dtime) -> dtime:
+        try:
+            if isinstance(time_str, str):
+                parts = time_str.split(":")
+                hour = int(parts[0])
+                minute = int(parts[1]) if len(parts) > 1 else 0
+                if 0 <= hour < 24 and 0 <= minute < 60:
+                    return dtime(hour, minute)
+        except Exception as exc:
+            logger.warning(
+                f"[QQ2TG][ID:{self.instance_id}] 冷却时间解析失败: {time_str}, error={exc}"
+            )
+        return fallback
+
+    def _get_banshi_interval_dynamic(self) -> int:
+        now = datetime.now().time()
+        if now >= self._day_start or now < self._night_start:
+            return self.cooldown_day_seconds
+        return self.cooldown_night_seconds
+
+    def _is_source_group(self, group_id_raw) -> bool:
+        if group_id_raw in self.banshi_group_list:
+            return True
+        try:
+            return int(group_id_raw) in self.banshi_group_list
+        except (ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def _is_queryable_message_id(message_id) -> bool:
+        return isinstance(message_id, (int, str)) and str(message_id).isdigit()
+
+    @staticmethod
+    def _pick_file_name(file_data: dict) -> str:
+        raw_name = file_data.get("name") or ""
+        if isinstance(raw_name, str):
+            cleaned = raw_name.strip()
+            if cleaned and cleaned not in {"拓展名", "扩展名", "unknown", "file.bin"}:
+                return cleaned
+
+        raw_file = file_data.get("file") or ""
+        if isinstance(raw_file, str):
+            cleaned = raw_file.strip()
+            if cleaned and not cleaned.startswith(("http://", "https://")):
+                return cleaned
+
+        return "unknown_file"
+
+    @staticmethod
+    def _ensure_fname_in_url(file_url: str, file_name: str) -> str:
+        if not isinstance(file_url, str) or not file_url.startswith(
+            ("http://", "https://")
+        ):
+            return file_url
+
+        try:
+            parsed = urlsplit(file_url)
+            query_items = parse_qsl(parsed.query, keep_blank_values=True)
+
+            has_fname = False
+            new_items = []
+            for key, value in query_items:
+                if key == "fname":
+                    has_fname = True
+                    if value:
+                        new_items.append((key, value))
+                    else:
+                        new_items.append((key, file_name))
+                else:
+                    new_items.append((key, value))
+
+            if not has_fname:
+                new_items.append(("fname", file_name))
+
+            new_query = "&".join(
+                [
+                    f"{quote(str(k), safe='')}={quote(str(v), safe='')}"
+                    for k, v in new_items
+                ]
+            )
+            return urlunsplit(
+                (parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment)
+            )
+        except Exception:
+            return file_url
+
+    @staticmethod
+    def _safe_file_name(file_name: str) -> str:
+        name = (file_name or "unknown_file").strip()
+        name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+        return name[:180] or "unknown_file"
+
+    async def _download_file_to_temp(self, file_url: str, file_name: str) -> str | None:
+        safe_name = self._safe_file_name(file_name)
+        tmp_dir = os.path.join(tempfile.gettempdir(), "astrbot_qq2tg_files")
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}_{safe_name}")
+
+        def _download() -> str | None:
+            req = urllib.request.Request(
+                file_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with (
+                urllib.request.urlopen(req, timeout=25) as resp,
+                open(tmp_path, "wb") as f,
+            ):
+                total = 0
+                while True:
+                    chunk = resp.read(1024 * 64)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > self.telegram_upload_max_bytes:
+                        raise ValueError("file_too_large")
+                    f.write(chunk)
+
+            if os.path.getsize(tmp_path) <= 0:
+                return None
+            return tmp_path
+
+        try:
+            return await asyncio.to_thread(_download)
+        except ValueError as exc:
+            if str(exc) == "file_too_large":
+                logger.info(
+                    f"[QQ2TG] 文件超过上限({self.telegram_upload_max_mb}MB)，回退为链接: {safe_name}"
+                )
+            return None
+        except Exception as exc:
+            logger.warning(f"[QQ2TG] 下载文件失败，回退为链接: {exc}")
+            return None
+
+    def _render_message_text(self, message_segments) -> str:
+        if not isinstance(message_segments, list):
+            return str(message_segments)
+
+        parts = []
+        for seg in message_segments:
+            if not isinstance(seg, dict):
+                parts.append(str(seg))
+                continue
+
+            seg_type = seg.get("type")
+            data = seg.get("data", {})
+
+            if seg_type == "text":
+                parts.append(data.get("text", ""))
+            elif seg_type == "at":
+                parts.append(f"@{data.get('qq', 'unknown')}")
+            elif seg_type == "image":
+                parts.append("[图片]")
+            elif seg_type == "face":
+                parts.append("[表情]")
+            elif seg_type == "reply":
+                parts.append("[回复]")
+            elif seg_type == "file":
+                file_name = data.get("name") or data.get("file") or "unknown"
+                parts.append(f"[文件:{file_name}]")
+            elif seg_type == "record":
+                parts.append("[语音]")
+            elif seg_type == "video":
+                parts.append("[视频]")
+            elif seg_type == "forward":
+                parts.append("[合并转发]")
+            else:
+                parts.append(f"[{seg_type or 'unknown'}]")
+
+        text = " ".join([p for p in parts if p]).strip()
+        return text or "[空消息]"
+
+    @staticmethod
+    def _escape_markdown(text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        escape_chars = r"_*[]()~`>#+-=|{}.!"
+        out = []
+        for ch in text:
+            if ch in escape_chars:
+                out.append("\\" + ch)
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    async def _build_forward_chain(
+        self,
+        msg_content,
+        source_group_name: str,
+        sender_name: str,
+        sender_id,
+        msg_time_str: str,
+    ):
+        safe_group = self._escape_markdown(str(source_group_name))
+        safe_sender = self._escape_markdown(str(sender_name))
+        safe_sender_id = self._escape_markdown(str(sender_id))
+        safe_time = self._escape_markdown(str(msg_time_str))
+
+        header_markdown = (
+            "*QQ -> Telegram 转发*\n"
+            f"*来源群*: `{safe_group}`\n"
+            f"*发送者*: `{safe_sender}` \\(`{safe_sender_id}`\\)\n"
+            f"*时间*: `{safe_time}`\n"
+        )
+
+        chains = [Comp.Plain(header_markdown)]
+        temp_files = []
+        text_parts = []
+
+        if not isinstance(msg_content, list):
+            msg_content = [
+                {
+                    "type": "text",
+                    "data": {"text": str(msg_content)},
+                }
+            ]
+
+        for seg in msg_content:
+            if not isinstance(seg, dict):
+                text_parts.append(str(seg))
+                continue
+
+            seg_type = seg.get("type")
+            data = seg.get("data", {})
+
+            if seg_type == "text":
+                txt = data.get("text", "")
+                if txt:
+                    text_parts.append(txt)
+                continue
+
+            if seg_type == "at":
+                text_parts.append(f"@{data.get('qq', 'unknown')}")
+                continue
+
+            if seg_type == "reply":
+                text_parts.append("[回复]")
+                continue
+
+            if seg_type == "image":
+                image_url = data.get("url") or data.get("file")
+                if isinstance(image_url, str) and image_url.startswith(
+                    ("http://", "https://")
+                ):
+                    chains.append(Comp.Image.fromURL(image_url))
+                else:
+                    text_parts.append("[图片]")
+                continue
+
+            if seg_type == "file":
+                file_url = data.get("url") or data.get("file")
+                file_name = self._pick_file_name(data)
+                if isinstance(file_url, str) and file_url.startswith(
+                    ("http://", "https://")
+                ):
+                    fixed_url = self._ensure_fname_in_url(file_url, file_name)
+                    if self.telegram_upload_files:
+                        local_path = await self._download_file_to_temp(
+                            fixed_url, file_name
+                        )
+                        if local_path:
+                            temp_files.append(local_path)
+                            chains.append(Comp.File(file=local_path, name=file_name))
+                        else:
+                            text_parts.append(f"[文件:{file_name}] {fixed_url}")
+                    else:
+                        text_parts.append(f"[文件:{file_name}] {fixed_url}")
+                else:
+                    text_parts.append(f"[文件:{file_name}]")
+                continue
+
+            if seg_type == "video":
+                text_parts.append("[视频]")
+                continue
+
+            if seg_type == "record":
+                text_parts.append("[语音]")
+                continue
+
+            if seg_type == "face":
+                text_parts.append("[表情]")
+                continue
+
+            text_parts.append(f"[{seg_type or 'unknown'}]")
+
+        body = " ".join([x for x in text_parts if x]).strip()
+        if body:
+            chains.append(Comp.Plain(body))
+        elif len(chains) == 1:
+            chains.append(Comp.Plain("[空消息]"))
+
+        return chains, temp_files
+
+    @filter.command("qq2tg_show_umo")
+    async def qq2tg_show_umo(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            f"当前会话 unified_msg_origin:\n{event.unified_msg_origin}\n"
+            f"平台: {event.get_platform_name()}"
+        )
+
+    @filter.command("qq2tg_bind_target")
+    async def qq2tg_bind_target(self, event: AstrMessageEvent):
+        platform = event.get_platform_name()
+        if platform != "telegram":
+            yield event.plain_result("请在 Telegram 目标聊天中执行此命令。")
+            return
+
+        umo = event.unified_msg_origin
+        if umo not in self.telegram_target_unified_origins:
+            self.telegram_target_unified_origins.append(umo)
+
+        yield event.plain_result(
+            "已绑定当前 Telegram 会话为转发目标(仅本次运行生效)。\n"
+            f"请把下面这一项写入插件配置 telegram_target_unified_origins:\n{umo}"
+        )
+
+    @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
+    async def handle_message(self, event: AstrMessageEvent):
+        group_id = event.message_obj.group_id
+        msg_id = event.message_obj.message_id
+        is_source = self._is_source_group(group_id)
+
+        logger.info(
+            f"[QQ2TG][ID:{self.instance_id}] 收到 QQ 消息 id={msg_id}, group={group_id}, in_source={is_source}"
+        )
+
+        if is_source:
+            if self._is_queryable_message_id(msg_id):
+                await self.local_cache.add_cache(msg_id)
+            else:
+                logger.debug(f"[QQ2TG] 跳过不可查询消息ID: {msg_id}")
+
+        has_pending = await self.local_cache.has_pending_messages()
+        if has_pending and not self.forward_lock.locked():
+            await self._execute_forward_and_cool(event)
+
+        if self.block_source_messages and is_source:
+            return MessageEventResult(None)
+        return None
+
+    async def _execute_forward_and_cool(self, event: AstrMessageEvent):
+        client = event.bot
+        self._forward_task = asyncio.current_task()
+
+        try:
+            cleaned = await self.local_cache._cleanup_expired_cache()
+            if cleaned:
+                logger.info(
+                    f"[QQ2TG][ID:{self.instance_id}] 清理过期缓存: {cleaned} 条"
+                )
+
+            async with self.forward_lock:
+                while True:
+                    waiting_messages = await self.local_cache.get_waiting_messages()
+                    if not waiting_messages:
+                        if await self.local_cache.has_pending_messages():
+                            earliest = await self.local_cache.get_earliest_timestamp()
+                            if earliest:
+                                wait_time = self.banshi_waiting_time - (
+                                    time.time() - earliest
+                                )
+                                if wait_time > 0:
+                                    await asyncio.sleep(wait_time + 0.1)
+                                continue
+                        break
+
+                    for msg_id in waiting_messages:
+                        earliest_timestamp_limit = (
+                            time.time() - self.banshi_cache_seconds
+                        )
+                        try:
+                            msg_detail = await client.api.call_action(
+                                "get_msg", message_id=msg_id
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                f"[QQ2TG] get_msg 失败, id={msg_id}, error={exc}"
+                            )
+                            await self.local_cache.remove_cache(msg_id)
+                            continue
+
+                        msg_time = msg_detail.get("time", 0)
+                        msg_content = msg_detail.get("message", [])
+                        if msg_time < earliest_timestamp_limit or not msg_content:
+                            await self.local_cache.remove_cache(msg_id)
+                            continue
+
+                        if not self.telegram_target_unified_origins:
+                            logger.warning(
+                                "[QQ2TG] telegram_target_unified_origins 为空，跳过转发。"
+                            )
+                            await self.local_cache.remove_cache(msg_id)
+                            continue
+
+                        sender_info = msg_detail.get("sender", {})
+                        sender_name = (
+                            sender_info.get("card")
+                            or sender_info.get("nickname")
+                            or "未知用户"
+                        )
+                        sender_id = sender_info.get("user_id", "未知ID")
+                        origin_group_id = msg_detail.get("group_id")
+                        source_group_name = f"未知群({origin_group_id})"
+
+                        if origin_group_id:
+                            try:
+                                group_info = await client.api.call_action(
+                                    "get_group_info",
+                                    group_id=int(origin_group_id),
+                                    no_cache=False,
+                                )
+                                source_group_name = group_info.get(
+                                    "group_name", source_group_name
+                                )
+                            except Exception:
+                                pass
+
+                        msg_time_str = time.strftime(
+                            "%Y-%m-%d %H:%M:%S", time.localtime(msg_time)
+                        )
+                        chains, temp_files = await self._build_forward_chain(
+                            msg_content=msg_content,
+                            source_group_name=source_group_name,
+                            sender_name=sender_name,
+                            sender_id=sender_id,
+                            msg_time_str=msg_time_str,
+                        )
+
+                        for target_umo in self.telegram_target_unified_origins:
+                            try:
+                                message_chain = MessageChain()
+                                message_chain.chain = list(chains)
+                                await self.context.send_message(
+                                    target_umo, message_chain
+                                )
+                                logger.info(
+                                    f"[QQ2TG] 转发成功: msg={msg_id} -> {target_umo}"
+                                )
+                            except Exception as exc:
+                                logger.error(
+                                    f"[QQ2TG] 转发失败: msg={msg_id} -> {target_umo}, error={exc}"
+                                )
+                            await asyncio.sleep(0.2)
+
+                        for temp_path in temp_files:
+                            try:
+                                if temp_path and os.path.exists(temp_path):
+                                    os.remove(temp_path)
+                            except Exception:
+                                pass
+
+                        await self.local_cache.remove_cache(msg_id)
+                        interval = self._get_banshi_interval_dynamic()
+                        await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.warning(f"[QQ2TG][ID:{self.instance_id}] 转发任务被取消")
+            raise
+        finally:
+            self._forward_task = None
+
+    async def terminate(self):
+        try:
+            if self._forward_task and not self._forward_task.done():
+                self._forward_task.cancel()
+        except Exception as exc:
+            logger.error(f"[QQ2TG][ID:{self.instance_id}] terminate 失败: {exc}")

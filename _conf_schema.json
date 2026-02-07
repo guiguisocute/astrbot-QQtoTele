@@ -1,0 +1,68 @@
+{
+  "banshi_waiting_time": {
+    "type": "int",
+    "default": 1,
+    "description": "消息等待时间, 消息进入缓存后等待多少秒才开始转发 (秒)"
+  },
+  "banshi_interval": {
+    "type": "int",
+    "default": 1,
+    "description": "搬史间隔, 单位: 秒"
+  },
+  "banshi_cache_seconds": {
+    "type": "int",
+    "default": 3600,
+    "description": "消息缓存时间限制, 也是转发前检查历史消息的时间窗口 (秒)"
+  },
+  "banshi_cooldown_day_seconds": {
+    "type": "int",
+    "default": 1,
+    "description": "动态冷却：白天(09:00-01:00) 冷却秒数"
+  },
+  "banshi_cooldown_night_seconds": {
+    "type": "int",
+    "default": 1,
+    "description": "动态冷却：夜间(01:00-09:00) 冷却秒数"
+  },
+  "banshi_cooldown_day_start": {
+    "type": "string",
+    "default": "09:00",
+    "description": "动态冷却：白天时段起始时间 (HH:MM)"
+  },
+  "banshi_cooldown_night_start": {
+    "type": "string",
+    "default": "01:00",
+    "description": "动态冷却：夜间时段起始时间 (HH:MM)"
+  },
+  "banshi_group_list": {
+    "type": "list",
+    "default": [],
+    "description": "史的来源群列表"
+  },
+  "banshi_target_list": {
+    "type": "list",
+    "default": [],
+    "description": "(兼容旧版) QQ 目标群列表。QQ->Telegram 转发不会使用此项"
+  },
+  "telegram_target_unified_origins": {
+    "type": "list",
+    "default": [],
+    "description": "Telegram 目标会话列表。每项形如 telegram:group_message:<chat_id> 或 telegram:private_message:<chat_id>"
+  },
+  "telegram_upload_files": {
+    "type": "bool",
+    "default": true,
+    "description": "是否下载QQ文件并重新上传到Telegram"
+  },
+  "telegram_upload_max_mb": {
+    "type": "int",
+    "default": 10,
+    "description": "文件上传大小上限(MB)，超限则回退为链接"
+  },
+  "block_source_messages": {
+    "description": "是否屏蔽源群消息",
+    "type": "bool",
+    "hint": "开启后将屏蔽banshi_group_list中的群消息",
+    "default": true
+  }
+}
