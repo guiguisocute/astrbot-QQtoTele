@@ -19,7 +19,7 @@ from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 from .storage.local_cache import LocalCache
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.3")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.4")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -343,6 +343,209 @@ class SowingDiscord(Star):
         return text or "[空消息]"
 
     @staticmethod
+    def _format_msg_time(raw_time, fallback: str = "") -> str:
+        if isinstance(raw_time, (int, float)):
+            try:
+                ts = int(raw_time)
+                if ts > 0:
+                    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+            except Exception:
+                pass
+        if isinstance(raw_time, str) and raw_time.strip():
+            return raw_time.strip()
+        return fallback or "未知时间"
+
+    @staticmethod
+    def _extract_forward_id(seg_data: dict) -> str:
+        for key in ("id", "resid", "forward_id"):
+            value = seg_data.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return ""
+
+    async def _call_get_forward_msg(self, client, forward_id: str) -> list:
+        if not forward_id:
+            return []
+
+        try:
+            resp = await client.api.call_action("get_forward_msg", id=forward_id)
+            if isinstance(resp, dict) and isinstance(resp.get("messages"), list):
+                return resp["messages"]
+        except Exception as exc:
+            logger.warning(
+                f"[QQ2TG] get_forward_msg 失败, id={forward_id}, error={exc}"
+            )
+        return []
+
+    @staticmethod
+    def _extract_node_segments(node: dict):
+        if not isinstance(node, dict):
+            return []
+
+        for key in ("content", "message", "messages"):
+            value = node.get(key)
+            if isinstance(value, list):
+                return value
+
+        raw_message = node.get("raw_message")
+        if isinstance(raw_message, str) and raw_message.strip():
+            return [{"type": "text", "data": {"text": raw_message}}]
+        return []
+
+    def _extract_node_meta(
+        self, node: dict, fallback_name: str, fallback_id, fallback_time: str
+    ):
+        sender = node.get("sender") if isinstance(node, dict) else None
+        if not isinstance(sender, dict):
+            sender = {}
+
+        sender_name = (
+            sender.get("card")
+            or sender.get("nickname")
+            or node.get("name")
+            or node.get("nickname")
+            or fallback_name
+            or "未知用户"
+        )
+        sender_id = (
+            sender.get("user_id")
+            or node.get("user_id")
+            or node.get("uin")
+            or fallback_id
+            or "未知ID"
+        )
+        msg_time_str = self._format_msg_time(node.get("time"), fallback=fallback_time)
+        return sender_name, sender_id, msg_time_str
+
+    async def _expand_segments_to_entries(
+        self,
+        client,
+        msg_segments,
+        sender_name: str,
+        sender_id,
+        msg_time_str: str,
+        depth: int = 0,
+    ):
+        if depth >= 4:
+            return [
+                {
+                    "msg_content": [
+                        {
+                            "type": "text",
+                            "data": {"text": "[嵌套合并转发层数过多]"},
+                        }
+                    ],
+                    "sender_name": sender_name,
+                    "sender_id": sender_id,
+                    "msg_time_str": msg_time_str,
+                }
+            ]
+
+        if not isinstance(msg_segments, list):
+            msg_segments = [{"type": "text", "data": {"text": str(msg_segments)}}]
+
+        entries = []
+        normal_buffer = []
+
+        def flush_normal_buffer():
+            if not normal_buffer:
+                return
+            entries.append(
+                {
+                    "msg_content": list(normal_buffer),
+                    "sender_name": sender_name,
+                    "sender_id": sender_id,
+                    "msg_time_str": msg_time_str,
+                }
+            )
+            normal_buffer.clear()
+
+        for seg in msg_segments:
+            if (
+                isinstance(seg, dict)
+                and seg.get("type") == "forward"
+                and isinstance(seg.get("data"), dict)
+            ):
+                flush_normal_buffer()
+
+                forward_id = self._extract_forward_id(seg.get("data", {}))
+                child_nodes = await self._call_get_forward_msg(client, forward_id)
+                if not child_nodes:
+                    entries.append(
+                        {
+                            "msg_content": [
+                                {
+                                    "type": "text",
+                                    "data": {
+                                        "text": f"[合并转发:{forward_id or 'unknown'}]"
+                                    },
+                                }
+                            ],
+                            "sender_name": sender_name,
+                            "sender_id": sender_id,
+                            "msg_time_str": msg_time_str,
+                        }
+                    )
+                    continue
+
+                for node in child_nodes:
+                    if not isinstance(node, dict):
+                        continue
+
+                    node_sender_name, node_sender_id, node_time_str = (
+                        self._extract_node_meta(
+                            node=node,
+                            fallback_name=sender_name,
+                            fallback_id=sender_id,
+                            fallback_time=msg_time_str,
+                        )
+                    )
+                    node_segments = self._extract_node_segments(node)
+
+                    if not node_segments:
+                        entries.append(
+                            {
+                                "msg_content": [
+                                    {"type": "text", "data": {"text": "[空消息]"}}
+                                ],
+                                "sender_name": node_sender_name,
+                                "sender_id": node_sender_id,
+                                "msg_time_str": node_time_str,
+                            }
+                        )
+                        continue
+
+                    nested_entries = await self._expand_segments_to_entries(
+                        client=client,
+                        msg_segments=node_segments,
+                        sender_name=node_sender_name,
+                        sender_id=node_sender_id,
+                        msg_time_str=node_time_str,
+                        depth=depth + 1,
+                    )
+                    entries.extend(nested_entries)
+                continue
+
+            normal_buffer.append(seg)
+
+        flush_normal_buffer()
+
+        if entries:
+            return entries
+
+        return [
+            {
+                "msg_content": [{"type": "text", "data": {"text": "[空消息]"}}],
+                "sender_name": sender_name,
+                "sender_id": sender_id,
+                "msg_time_str": msg_time_str,
+            }
+        ]
+
+    @staticmethod
     def _escape_markdown(text: str) -> str:
         if not isinstance(text, str):
             return ""
@@ -603,40 +806,47 @@ class SowingDiscord(Star):
                             except Exception:
                                 pass
 
-                        msg_time_str = time.strftime(
-                            "%Y-%m-%d %H:%M:%S", time.localtime(msg_time)
-                        )
-                        chains, temp_files = await self._build_forward_chain(
-                            msg_content=msg_content,
-                            source_group_name=source_group_name,
-                            source_group_id=origin_group_id_text,
+                        msg_time_str = self._format_msg_time(msg_time)
+                        entry_list = await self._expand_segments_to_entries(
+                            client=client,
+                            msg_segments=msg_content,
                             sender_name=sender_name,
                             sender_id=sender_id,
                             msg_time_str=msg_time_str,
                         )
 
-                        for target_umo in self.telegram_target_unified_origins:
-                            try:
-                                message_chain = MessageChain()
-                                message_chain.chain = list(chains)
-                                await self.context.send_message(
-                                    target_umo, message_chain
-                                )
-                                logger.info(
-                                    f"[QQ2TG] 转发成功: msg={msg_id} -> {target_umo}"
-                                )
-                            except Exception as exc:
-                                logger.error(
-                                    f"[QQ2TG] 转发失败: msg={msg_id} -> {target_umo}, error={exc}"
-                                )
-                            await asyncio.sleep(0.2)
+                        for entry in entry_list:
+                            chains, temp_files = await self._build_forward_chain(
+                                msg_content=entry["msg_content"],
+                                source_group_name=source_group_name,
+                                source_group_id=origin_group_id_text,
+                                sender_name=entry["sender_name"],
+                                sender_id=entry["sender_id"],
+                                msg_time_str=entry["msg_time_str"],
+                            )
 
-                        for temp_path in temp_files:
-                            try:
-                                if temp_path and os.path.exists(temp_path):
-                                    os.remove(temp_path)
-                            except Exception:
-                                pass
+                            for target_umo in self.telegram_target_unified_origins:
+                                try:
+                                    message_chain = MessageChain()
+                                    message_chain.chain = list(chains)
+                                    await self.context.send_message(
+                                        target_umo, message_chain
+                                    )
+                                    logger.info(
+                                        f"[QQ2TG] 转发成功: msg={msg_id} -> {target_umo}"
+                                    )
+                                except Exception as exc:
+                                    logger.error(
+                                        f"[QQ2TG] 转发失败: msg={msg_id} -> {target_umo}, error={exc}"
+                                    )
+                                await asyncio.sleep(0.2)
+
+                            for temp_path in temp_files:
+                                try:
+                                    if temp_path and os.path.exists(temp_path):
+                                        os.remove(temp_path)
+                                except Exception:
+                                    pass
 
                         await self.local_cache.remove_cache(msg_id)
                         interval = self._get_banshi_interval_dynamic()
