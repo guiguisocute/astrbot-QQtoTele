@@ -19,7 +19,7 @@ from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 from .storage.local_cache import LocalCache
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.4")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.5")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
