@@ -1,4 +1,6 @@
 import asyncio
+import html
+import json
 import os
 import re
 import tempfile
@@ -179,6 +181,86 @@ class SowingDiscord(Star):
         name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
         return name[:180] or "unknown_file"
 
+    @staticmethod
+    def _find_first_nonempty_by_keys(obj, keys: set[str]) -> str:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if str(k).lower() in keys and isinstance(v, (str, int, float)):
+                    text = str(v).strip()
+                    if text:
+                        return text
+            for v in obj.values():
+                found = SowingDiscord._find_first_nonempty_by_keys(v, keys)
+                if found:
+                    return found
+            return ""
+
+        if isinstance(obj, list):
+            for item in obj:
+                found = SowingDiscord._find_first_nonempty_by_keys(item, keys)
+                if found:
+                    return found
+            return ""
+
+        return ""
+
+    @classmethod
+    def _parse_json_segment_summary(cls, data: dict) -> str:
+        raw = data.get("data")
+        obj = None
+
+        if isinstance(raw, dict):
+            obj = raw
+        elif isinstance(raw, str):
+            payload = raw.strip()
+            if payload:
+                candidates = [payload, html.unescape(payload)]
+                for candidate in candidates:
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, str):
+                            parsed = json.loads(parsed)
+                        if isinstance(parsed, (dict, list)):
+                            obj = parsed
+                            break
+                    except Exception:
+                        continue
+
+        if obj is None:
+            preview = str(raw).strip() if raw is not None else ""
+            if len(preview) > 160:
+                preview = preview[:157] + "..."
+            return f"[JSON卡片] {preview}" if preview else "[JSON卡片]"
+
+        title = cls._find_first_nonempty_by_keys(
+            obj, {"title", "prompt", "source", "name"}
+        )
+        desc = cls._find_first_nonempty_by_keys(
+            obj, {"desc", "description", "summary", "text", "content"}
+        )
+        url = cls._find_first_nonempty_by_keys(
+            obj,
+            {
+                "url",
+                "jumpurl",
+                "qqdocurl",
+                "newsurl",
+                "docurl",
+                "target",
+                "link",
+            },
+        )
+
+        parts = ["[JSON卡片]"]
+        if title:
+            parts.append(f"标题: {title}")
+        if desc and desc != title:
+            parts.append(f"摘要: {desc}")
+        if url:
+            parts.append(f"链接: {url}")
+
+        return " | ".join(parts)
+
     async def _download_file_to_temp(self, file_url: str, file_name: str) -> str | None:
         safe_name = self._safe_file_name(file_name)
         tmp_dir = os.path.join(tempfile.gettempdir(), "astrbot_qq2tg_files")
@@ -252,6 +334,8 @@ class SowingDiscord(Star):
                 parts.append("[视频]")
             elif seg_type == "forward":
                 parts.append("[合并转发]")
+            elif seg_type == "json":
+                parts.append(self._parse_json_segment_summary(data))
             else:
                 parts.append(f"[{seg_type or 'unknown'}]")
 
@@ -367,6 +451,10 @@ class SowingDiscord(Star):
 
             if seg_type == "face":
                 text_parts.append("[表情]")
+                continue
+
+            if seg_type == "json":
+                text_parts.append(self._parse_json_segment_summary(data))
                 continue
 
             text_parts.append(f"[{seg_type or 'unknown'}]")
@@ -488,7 +576,10 @@ class SowingDiscord(Star):
                         )
                         sender_id = sender_info.get("user_id", "未知ID")
                         origin_group_id = msg_detail.get("group_id")
-                        source_group_name = f"未知群({origin_group_id})"
+                        origin_group_id_text = (
+                            str(origin_group_id) if origin_group_id else "未知群号"
+                        )
+                        source_group_name = "未知群"
 
                         if origin_group_id:
                             try:
@@ -503,12 +594,16 @@ class SowingDiscord(Star):
                             except Exception:
                                 pass
 
+                        source_group_display = (
+                            f"{source_group_name} ({origin_group_id_text})"
+                        )
+
                         msg_time_str = time.strftime(
                             "%Y-%m-%d %H:%M:%S", time.localtime(msg_time)
                         )
                         chains, temp_files = await self._build_forward_chain(
                             msg_content=msg_content,
-                            source_group_name=source_group_name,
+                            source_group_name=source_group_display,
                             sender_name=sender_name,
                             sender_id=sender_id,
                             msg_time_str=msg_time_str,
