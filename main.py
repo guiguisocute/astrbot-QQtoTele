@@ -19,7 +19,7 @@ from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 from .storage.local_cache import LocalCache
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.2")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.3")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -359,19 +359,21 @@ class SowingDiscord(Star):
         self,
         msg_content,
         source_group_name: str,
+        source_group_id,
         sender_name: str,
         sender_id,
         msg_time_str: str,
     ):
         safe_group = self._escape_markdown(str(source_group_name))
+        safe_group_id = self._escape_markdown(str(source_group_id))
         safe_sender = self._escape_markdown(str(sender_name))
         safe_sender_id = self._escape_markdown(str(sender_id))
         safe_time = self._escape_markdown(str(msg_time_str))
 
         header_markdown = (
             "*QQ -> Telegram 转发*\n"
-            f"*来源群*: `{safe_group}`\n"
-            f"*发送者*: `{safe_sender}` \\(`{safe_sender_id}`\\)\n"
+            f"*来源群*: `{safe_group}` (`{safe_group_id}`)\n"
+            f"*发送者*: `{safe_sender}` (`{safe_sender_id}`)\n"
             f"*时间*: `{safe_time}`\n"
         )
 
@@ -601,16 +603,13 @@ class SowingDiscord(Star):
                             except Exception:
                                 pass
 
-                        source_group_display = (
-                            f"{source_group_name} ({origin_group_id_text})"
-                        )
-
                         msg_time_str = time.strftime(
                             "%Y-%m-%d %H:%M:%S", time.localtime(msg_time)
                         )
                         chains, temp_files = await self._build_forward_chain(
                             msg_content=msg_content,
-                            source_group_name=source_group_display,
+                            source_group_name=source_group_name,
+                            source_group_id=origin_group_id_text,
                             sender_name=sender_name,
                             sender_id=sender_id,
                             msg_time_str=msg_time_str,
