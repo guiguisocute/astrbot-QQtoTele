@@ -19,7 +19,7 @@ from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 from .storage.local_cache import LocalCache
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.0")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.2")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -502,7 +502,7 @@ class SowingDiscord(Star):
 
         if is_source:
             if self._is_queryable_message_id(msg_id):
-                await self.local_cache.add_cache(msg_id)
+                await self.local_cache.add_cache(msg_id, group_id=group_id)
             else:
                 logger.debug(f"[QQ2TG] 跳过不可查询消息ID: {msg_id}")
 
@@ -575,7 +575,14 @@ class SowingDiscord(Star):
                             or "未知用户"
                         )
                         sender_id = sender_info.get("user_id", "未知ID")
-                        origin_group_id = msg_detail.get("group_id")
+                        cached_group_id = await self.local_cache.get_message_group_id(
+                            msg_id
+                        )
+                        origin_group_id = (
+                            msg_detail.get("group_id")
+                            or cached_group_id
+                            or sender_info.get("group_id")
+                        )
                         origin_group_id_text = (
                             str(origin_group_id) if origin_group_id else "未知群号"
                         )
