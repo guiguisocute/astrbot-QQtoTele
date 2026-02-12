@@ -19,7 +19,7 @@ from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 from .storage.local_cache import LocalCache
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.5")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.6")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -302,6 +302,43 @@ class SowingDiscord(Star):
             logger.warning(f"[QQ2TG] 下载文件失败，回退为链接: {exc}")
             return None
 
+    async def _resolve_file_url(self, client, source_group_id, file_data: dict) -> str:
+        direct_url = file_data.get("url") or file_data.get("file")
+        if isinstance(direct_url, str) and direct_url.startswith(
+            ("http://", "https://")
+        ):
+            return direct_url
+
+        file_id = (
+            file_data.get("file_id") or file_data.get("id") or file_data.get("fid")
+        )
+        busid = file_data.get("busid") or file_data.get("bus_id")
+
+        if not client or not source_group_id or not file_id:
+            return ""
+
+        try:
+            payload = {"group_id": int(source_group_id), "file_id": str(file_id)}
+            busid_text = str(busid).strip() if busid is not None else ""
+            if busid_text.isdigit():
+                payload["busid"] = int(busid_text)
+
+            resp = await client.api.call_action("get_group_file_url", **payload)
+            if isinstance(resp, dict):
+                url = (
+                    resp.get("url")
+                    or resp.get("file_url")
+                    or (resp.get("data") or {}).get("url")
+                )
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    return url
+        except Exception as exc:
+            logger.debug(
+                f"[QQ2TG] get_group_file_url 失败, data={file_data}, error={exc}"
+            )
+
+        return ""
+
     def _render_message_text(self, message_segments) -> str:
         if not isinstance(message_segments, list):
             return str(message_segments)
@@ -563,9 +600,11 @@ class SowingDiscord(Star):
         msg_content,
         source_group_name: str,
         source_group_id,
+        source_group_id_raw,
         sender_name: str,
         sender_id,
         msg_time_str: str,
+        client=None,
     ):
         safe_group = self._escape_markdown(str(source_group_name))
         safe_group_id = self._escape_markdown(str(source_group_id))
@@ -625,7 +664,11 @@ class SowingDiscord(Star):
                 continue
 
             if seg_type == "file":
-                file_url = data.get("url") or data.get("file")
+                file_url = await self._resolve_file_url(
+                    client=client,
+                    source_group_id=source_group_id_raw,
+                    file_data=data,
+                )
                 file_name = self._pick_file_name(data)
                 if isinstance(file_url, str) and file_url.startswith(
                     ("http://", "https://")
@@ -820,9 +863,11 @@ class SowingDiscord(Star):
                                 msg_content=entry["msg_content"],
                                 source_group_name=source_group_name,
                                 source_group_id=origin_group_id_text,
+                                source_group_id_raw=origin_group_id,
                                 sender_name=entry["sender_name"],
                                 sender_id=entry["sender_id"],
                                 msg_time_str=entry["msg_time_str"],
+                                client=client,
                             )
 
                             for target_umo in self.telegram_target_unified_origins:

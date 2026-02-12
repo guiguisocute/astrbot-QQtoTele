@@ -1,6 +1,6 @@
 name: astrbot_qq_to_telegram
 desc: QQ 源群消息转发到 Telegram 目标会话
 help: 配置源 QQ 群和 telegram_target_unified_origins 后自动转发
-version: v1.0.5
+version: v1.0.6
 author: guiguisocute
 repo: https://github.com/guiguisocute/astrbot-QQtoTele
