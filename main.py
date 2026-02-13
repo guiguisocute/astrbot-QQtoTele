@@ -20,7 +20,7 @@ from .storage.local_cache import LocalCache
 from .storage.markdown_archive import MarkdownArchive
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.0")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.1")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -987,6 +987,9 @@ class SowingDiscord(Star):
                         break
 
                     for msg_id in waiting_messages:
+                        logger.info(
+                            f"[QQ2TG] 开始处理消息: id={msg_id}, queue={len(waiting_messages)}"
+                        )
                         earliest_timestamp_limit = (
                             time.time() - self.banshi_cache_seconds
                         )
@@ -1065,10 +1068,15 @@ class SowingDiscord(Star):
                             sender_id=sender_id,
                             msg_time_str=msg_time_str,
                         )
+                        logger.info(
+                            f"[QQ2TG] 消息展开完成: msg={msg_id}, entries={len(entry_list)}, group={origin_group_id_text}"
+                        )
 
                         archive_key = f"{origin_group_id_text}:{msg_id}"
                         archive_skip = False
                         archive_ok = bool(self.enable_markdown_archive)
+                        archive_written_count = 0
+                        archive_target_file = ""
                         if self.enable_markdown_archive and self.markdown_archive:
                             archive_skip = await self.markdown_archive.has_processed(
                                 archive_key
@@ -1133,9 +1141,12 @@ class SowingDiscord(Star):
                                         message_id=msg_id,
                                         client=client,
                                     )
-                                    await self.markdown_archive.append_entry(
-                                        day_str, block
+                                    archive_target_file = (
+                                        await self.markdown_archive.append_entry(
+                                            day_str, block
+                                        )
                                     )
+                                    archive_written_count += 1
                                 except Exception as exc:
                                     archive_ok = False
                                     logger.error(
@@ -1156,6 +1167,13 @@ class SowingDiscord(Star):
                                     "day": day_str,
                                 },
                             )
+                            logger.info(
+                                f"[QQ2TG][Archive] 归档成功: msg={msg_id}, entries={archive_written_count}, file={archive_target_file}"
+                            )
+
+                        logger.info(
+                            f"[QQ2TG] 消息处理完成: msg={msg_id}, telegram={self.enable_telegram_forward}, markdown={self.enable_markdown_archive}"
+                        )
 
                         await self.local_cache.remove_cache(msg_id)
                         interval = self._get_banshi_interval_dynamic()

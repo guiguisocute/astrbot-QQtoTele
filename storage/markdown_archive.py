@@ -57,13 +57,14 @@ class MarkdownArchive:
             with open(self._index_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
 
-    async def append_entry(self, day_str: str, content: str):
+    async def append_entry(self, day_str: str, content: str) -> str:
         async with self._lock:
             day_dir = os.path.join(self.root_dir, day_str)
             os.makedirs(day_dir, exist_ok=True)
             target_file = os.path.join(day_dir, "messages.md")
             with open(target_file, "a", encoding="utf-8") as f:
                 f.write(content)
+            return target_file
 
     async def save_url_asset(
         self,
@@ -107,7 +108,9 @@ class MarkdownArchive:
             ok = await asyncio.to_thread(_download)
             if not ok:
                 return None
-            return f"{category}/{target_name}".replace("\\", "/")
+            rel = f"{category}/{target_name}".replace("\\", "/")
+            logger.info(f"[QQ2TG][Archive] 附件已保存: {day_str}/{rel}")
+            return rel
         except ValueError as exc:
             if str(exc) == "asset_too_large":
                 logger.info(
