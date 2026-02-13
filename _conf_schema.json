@@ -49,6 +49,31 @@
     "default": [],
     "description": "Telegram 目标会话列表。每项形如 telegram:group_message:<chat_id> 或 telegram:private_message:<chat_id>"
   },
+  "enable_telegram_forward": {
+    "type": "bool",
+    "default": true,
+    "description": "是否启用 Telegram 转发通道"
+  },
+  "enable_markdown_archive": {
+    "type": "bool",
+    "default": true,
+    "description": "是否启用 Markdown 本地归档通道"
+  },
+  "archive_root": {
+    "type": "string",
+    "default": "/AstrBot/data/qq2tg_archive",
+    "description": "Markdown 归档根目录（容器内路径）"
+  },
+  "archive_save_assets": {
+    "type": "bool",
+    "default": true,
+    "description": "归档时是否下载并保存图片/文件附件"
+  },
+  "archive_asset_max_mb": {
+    "type": "int",
+    "default": 20,
+    "description": "归档附件下载大小上限(MB)，超限则仅记录链接"
+  },
   "telegram_upload_files": {
     "type": "bool",
     "default": true,

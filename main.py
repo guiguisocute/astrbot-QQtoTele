@@ -17,9 +17,10 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 
 from .storage.local_cache import LocalCache
+from .storage.markdown_archive import MarkdownArchive
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.0.6")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.0")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -59,6 +60,24 @@ class SowingDiscord(Star):
         self.telegram_upload_max_bytes = (
             max(1, self.telegram_upload_max_mb) * 1024 * 1024
         )
+
+        self.enable_telegram_forward = bool(config.get("enable_telegram_forward", True))
+        self.enable_markdown_archive = bool(config.get("enable_markdown_archive", True))
+        self.archive_root = str(
+            config.get("archive_root", "/AstrBot/data/qq2tg_archive")
+        )
+        self.archive_save_assets = bool(config.get("archive_save_assets", True))
+        self.archive_asset_max_mb = int(config.get("archive_asset_max_mb", 20))
+        self.markdown_archive = (
+            MarkdownArchive(
+                root_dir=self.archive_root,
+                save_assets=self.archive_save_assets,
+                asset_max_mb=self.archive_asset_max_mb,
+            )
+            if self.enable_markdown_archive
+            else None
+        )
+
         self.local_cache = LocalCache(
             max_age_seconds=self.banshi_cache_seconds,
             waiting_time=self.banshi_waiting_time,
@@ -72,6 +91,13 @@ class SowingDiscord(Star):
         logger.info(
             f"[QQ2TG][ID:{self.instance_id}] Telegram 目标: {self.telegram_target_unified_origins}"
         )
+        logger.info(
+            f"[QQ2TG][ID:{self.instance_id}] 输出模式: telegram={self.enable_telegram_forward}, markdown={self.enable_markdown_archive}"
+        )
+        if self.enable_markdown_archive:
+            logger.info(
+                f"[QQ2TG][ID:{self.instance_id}] Markdown 归档目录: {self.archive_root}"
+            )
 
     @staticmethod
     def _normalize_int_list(raw):
@@ -715,11 +741,183 @@ class SowingDiscord(Star):
 
         return chains, temp_files
 
+    @staticmethod
+    def _archive_day_str(raw_time, fallback: str = "") -> str:
+        if isinstance(raw_time, (int, float)):
+            try:
+                ts = int(raw_time)
+                if ts > 0:
+                    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        if isinstance(fallback, str):
+            m = re.match(r"^(\d{4}-\d{2}-\d{2})", fallback.strip())
+            if m:
+                return m.group(1)
+
+        return datetime.now().strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _md_inline(text) -> str:
+        return str(text).replace("`", "'")
+
+    async def _build_markdown_block(
+        self,
+        msg_content,
+        source_group_name: str,
+        source_group_id,
+        source_group_id_raw,
+        sender_name: str,
+        sender_id,
+        msg_time_str: str,
+        day_str: str,
+        message_id,
+        client=None,
+    ) -> str:
+        if not isinstance(msg_content, list):
+            msg_content = [
+                {
+                    "type": "text",
+                    "data": {"text": str(msg_content)},
+                }
+            ]
+
+        text_parts = []
+        attachment_parts = []
+
+        for seg in msg_content:
+            if not isinstance(seg, dict):
+                text_parts.append(str(seg))
+                continue
+
+            seg_type = seg.get("type")
+            data = seg.get("data", {})
+
+            if seg_type == "text":
+                txt = data.get("text", "")
+                if txt:
+                    text_parts.append(txt)
+                continue
+
+            if seg_type == "at":
+                text_parts.append(f"@{data.get('qq', 'unknown')}")
+                continue
+
+            if seg_type == "reply":
+                text_parts.append("[回复]")
+                continue
+
+            if seg_type == "json":
+                text_parts.append(self._parse_json_segment_summary(data))
+                continue
+
+            if seg_type == "image":
+                image_url = data.get("url") or data.get("file")
+                if isinstance(image_url, str) and image_url.startswith(
+                    ("http://", "https://")
+                ):
+                    image_name = (
+                        self.markdown_archive.guess_name_from_url(
+                            image_url, "image.jpg"
+                        )
+                        if self.markdown_archive
+                        else "image.jpg"
+                    )
+                    local_rel = None
+                    if self.markdown_archive:
+                        local_rel = await self.markdown_archive.save_url_asset(
+                            day_str=day_str,
+                            category="photos",
+                            url=image_url,
+                            preferred_name=image_name,
+                        )
+
+                    if local_rel:
+                        attachment_parts.append(f"- 图片: ![{image_name}]({local_rel})")
+                    else:
+                        attachment_parts.append(f"- 图片: {image_url}")
+                else:
+                    text_parts.append("[图片]")
+                continue
+
+            if seg_type == "file":
+                file_url = await self._resolve_file_url(
+                    client=client,
+                    source_group_id=source_group_id_raw,
+                    file_data=data,
+                )
+                file_name = self._pick_file_name(data)
+                if isinstance(file_url, str) and file_url.startswith(
+                    ("http://", "https://")
+                ):
+                    fixed_url = self._ensure_fname_in_url(file_url, file_name)
+                    local_rel = None
+                    if self.markdown_archive:
+                        local_rel = await self.markdown_archive.save_url_asset(
+                            day_str=day_str,
+                            category="files",
+                            url=fixed_url,
+                            preferred_name=file_name,
+                        )
+                    if local_rel:
+                        attachment_parts.append(f"- 文件: [{file_name}]({local_rel})")
+                    else:
+                        attachment_parts.append(f"- 文件: [{file_name}]({fixed_url})")
+                else:
+                    attachment_parts.append(f"- 文件: {file_name}")
+                continue
+
+            if seg_type == "video":
+                text_parts.append("[视频]")
+                continue
+
+            if seg_type == "record":
+                text_parts.append("[语音]")
+                continue
+
+            if seg_type == "face":
+                text_parts.append("[表情]")
+                continue
+
+            text_parts.append(f"[{seg_type or 'unknown'}]")
+
+        body = " ".join([x for x in text_parts if x]).strip() or "[空消息]"
+
+        lines = [
+            f"## {self._md_inline(msg_time_str)}",
+            f"- 来源群: `{self._md_inline(source_group_name)}` (`{self._md_inline(source_group_id)}`)",
+            f"- 发送者: `{self._md_inline(sender_name)}` (`{self._md_inline(sender_id)}`)",
+            f"- 消息ID: `{self._md_inline(message_id)}`",
+            "",
+            body,
+        ]
+
+        if attachment_parts:
+            lines.extend(["", "附件:"])
+            lines.extend(attachment_parts)
+
+        lines.extend(["", "---", ""])
+        return "\n".join(lines)
+
     @filter.command("qq2tg_show_umo")
     async def qq2tg_show_umo(self, event: AstrMessageEvent):
         yield event.plain_result(
             f"当前会话 unified_msg_origin:\n{event.unified_msg_origin}\n"
             f"平台: {event.get_platform_name()}"
+        )
+
+    @filter.command("qq2tg_show_archive")
+    async def qq2tg_show_archive(self, event: AstrMessageEvent):
+        archive_status = "开启" if self.enable_markdown_archive else "关闭"
+        tg_status = "开启" if self.enable_telegram_forward else "关闭"
+        target_count = len(self.telegram_target_unified_origins)
+        yield event.plain_result(
+            "当前输出通道状态:\n"
+            f"- Telegram: {tg_status} (目标数: {target_count})\n"
+            f"- Markdown归档: {archive_status}\n"
+            f"- 归档目录: {self.archive_root}\n"
+            f"- 附件保存: {'开启' if self.archive_save_assets else '关闭'}"
         )
 
     @filter.command("qq2tg_bind_target")
@@ -809,12 +1007,21 @@ class SowingDiscord(Star):
                             await self.local_cache.remove_cache(msg_id)
                             continue
 
-                        if not self.telegram_target_unified_origins:
-                            logger.warning(
-                                "[QQ2TG] telegram_target_unified_origins 为空，跳过转发。"
-                            )
+                        if (
+                            not self.enable_telegram_forward
+                            and not self.enable_markdown_archive
+                        ):
+                            logger.warning("[QQ2TG] 所有输出通道均已关闭，跳过消息。")
                             await self.local_cache.remove_cache(msg_id)
                             continue
+
+                        if (
+                            self.enable_telegram_forward
+                            and not self.telegram_target_unified_origins
+                        ):
+                            logger.warning(
+                                "[QQ2TG] telegram_target_unified_origins 为空，Telegram 通道跳过。"
+                            )
 
                         sender_info = msg_detail.get("sender", {})
                         sender_name = (
@@ -850,6 +1057,7 @@ class SowingDiscord(Star):
                                 pass
 
                         msg_time_str = self._format_msg_time(msg_time)
+                        day_str = self._archive_day_str(msg_time, msg_time_str)
                         entry_list = await self._expand_segments_to_entries(
                             client=client,
                             msg_segments=msg_content,
@@ -858,40 +1066,96 @@ class SowingDiscord(Star):
                             msg_time_str=msg_time_str,
                         )
 
-                        for entry in entry_list:
-                            chains, temp_files = await self._build_forward_chain(
-                                msg_content=entry["msg_content"],
-                                source_group_name=source_group_name,
-                                source_group_id=origin_group_id_text,
-                                source_group_id_raw=origin_group_id,
-                                sender_name=entry["sender_name"],
-                                sender_id=entry["sender_id"],
-                                msg_time_str=entry["msg_time_str"],
-                                client=client,
+                        archive_key = f"{origin_group_id_text}:{msg_id}"
+                        archive_skip = False
+                        archive_ok = bool(self.enable_markdown_archive)
+                        if self.enable_markdown_archive and self.markdown_archive:
+                            archive_skip = await self.markdown_archive.has_processed(
+                                archive_key
                             )
+                            if archive_skip:
+                                logger.info(f"[QQ2TG][Archive] 去重跳过: {archive_key}")
 
-                            for target_umo in self.telegram_target_unified_origins:
+                        for entry in entry_list:
+                            if (
+                                self.enable_telegram_forward
+                                and self.telegram_target_unified_origins
+                            ):
+                                chains, temp_files = await self._build_forward_chain(
+                                    msg_content=entry["msg_content"],
+                                    source_group_name=source_group_name,
+                                    source_group_id=origin_group_id_text,
+                                    source_group_id_raw=origin_group_id,
+                                    sender_name=entry["sender_name"],
+                                    sender_id=entry["sender_id"],
+                                    msg_time_str=entry["msg_time_str"],
+                                    client=client,
+                                )
+
+                                for target_umo in self.telegram_target_unified_origins:
+                                    try:
+                                        message_chain = MessageChain()
+                                        message_chain.chain = list(chains)
+                                        await self.context.send_message(
+                                            target_umo, message_chain
+                                        )
+                                        logger.info(
+                                            f"[QQ2TG] 转发成功: msg={msg_id} -> {target_umo}"
+                                        )
+                                    except Exception as exc:
+                                        logger.error(
+                                            f"[QQ2TG] 转发失败: msg={msg_id} -> {target_umo}, error={exc}"
+                                        )
+                                    await asyncio.sleep(0.2)
+
+                                for temp_path in temp_files:
+                                    try:
+                                        if temp_path and os.path.exists(temp_path):
+                                            os.remove(temp_path)
+                                    except Exception:
+                                        pass
+
+                            if (
+                                self.enable_markdown_archive
+                                and self.markdown_archive
+                                and not archive_skip
+                            ):
                                 try:
-                                    message_chain = MessageChain()
-                                    message_chain.chain = list(chains)
-                                    await self.context.send_message(
-                                        target_umo, message_chain
+                                    block = await self._build_markdown_block(
+                                        msg_content=entry["msg_content"],
+                                        source_group_name=source_group_name,
+                                        source_group_id=origin_group_id_text,
+                                        source_group_id_raw=origin_group_id,
+                                        sender_name=entry["sender_name"],
+                                        sender_id=entry["sender_id"],
+                                        msg_time_str=entry["msg_time_str"],
+                                        day_str=day_str,
+                                        message_id=msg_id,
+                                        client=client,
                                     )
-                                    logger.info(
-                                        f"[QQ2TG] 转发成功: msg={msg_id} -> {target_umo}"
+                                    await self.markdown_archive.append_entry(
+                                        day_str, block
                                     )
                                 except Exception as exc:
+                                    archive_ok = False
                                     logger.error(
-                                        f"[QQ2TG] 转发失败: msg={msg_id} -> {target_umo}, error={exc}"
+                                        f"[QQ2TG][Archive] 写入失败: msg={msg_id}, error={exc}"
                                     )
-                                await asyncio.sleep(0.2)
 
-                            for temp_path in temp_files:
-                                try:
-                                    if temp_path and os.path.exists(temp_path):
-                                        os.remove(temp_path)
-                                except Exception:
-                                    pass
+                        if (
+                            self.enable_markdown_archive
+                            and self.markdown_archive
+                            and not archive_skip
+                            and archive_ok
+                        ):
+                            await self.markdown_archive.mark_processed(
+                                archive_key,
+                                {
+                                    "ts": int(time.time()),
+                                    "msg_time": msg_time_str,
+                                    "day": day_str,
+                                },
+                            )
 
                         await self.local_cache.remove_cache(msg_id)
                         interval = self._get_banshi_interval_dynamic()
