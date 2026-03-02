@@ -20,7 +20,7 @@ from .storage.local_cache import LocalCache
 from .storage.markdown_archive import MarkdownArchive
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.1")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.2")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -48,6 +48,9 @@ class SowingDiscord(Star):
         )
         self.banshi_target_list = self._normalize_int_list(
             config.get("banshi_target_list")
+        )
+        self.qq_block_prefixes = self._normalize_prefix_list(
+            config.get("qq_block_prefixes", ["!!"])
         )
         self.telegram_target_unified_origins = self._normalize_str_list(
             config.get("telegram_target_unified_origins")
@@ -85,6 +88,7 @@ class SowingDiscord(Star):
 
         self.forward_lock = asyncio.Lock()
         self._forward_task = None
+        self._group_prefix_blocked: set[str] = set()
 
         logger.info(f"[QQ2TG][ID:{self.instance_id}] 插件初始化完成")
         logger.info(f"[QQ2TG][ID:{self.instance_id}] 来源群: {self.banshi_group_list}")
@@ -111,6 +115,15 @@ class SowingDiscord(Star):
     def _normalize_str_list(raw):
         if isinstance(raw, str):
             return [raw.strip()] if raw.strip() else []
+        if isinstance(raw, list):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        return []
+
+    @staticmethod
+    def _normalize_prefix_list(raw):
+        if isinstance(raw, str):
+            text = raw.strip()
+            return [text] if text else []
         if isinstance(raw, list):
             return [str(x).strip() for x in raw if str(x).strip()]
         return []
@@ -146,6 +159,52 @@ class SowingDiscord(Star):
     @staticmethod
     def _is_queryable_message_id(message_id) -> bool:
         return isinstance(message_id, (int, str)) and str(message_id).isdigit()
+
+    @staticmethod
+    def _group_state_key(group_id_raw) -> str:
+        if group_id_raw is None:
+            return ""
+        try:
+            return str(int(group_id_raw))
+        except (TypeError, ValueError):
+            text = str(group_id_raw).strip()
+            return text
+
+    def _event_starts_with_prefix(self, event: AstrMessageEvent, prefix: str) -> bool:
+        if not prefix:
+            return False
+
+        msg_obj = getattr(event, "message_obj", None)
+        raw_text = ""
+
+        if msg_obj is not None:
+            for attr in ("message", "messages", "content"):
+                segs = getattr(msg_obj, attr, None)
+                if isinstance(segs, list):
+                    raw_text = self._render_message_text(segs)
+                    break
+
+            if not raw_text:
+                for attr in ("raw_message", "message_str", "text"):
+                    value = getattr(msg_obj, attr, None)
+                    if isinstance(value, str) and value:
+                        raw_text = value
+                        break
+
+        if not raw_text:
+            event_msg_str = getattr(event, "message_str", None)
+            if isinstance(event_msg_str, str):
+                raw_text = event_msg_str
+
+        return isinstance(raw_text, str) and raw_text.startswith(prefix)
+
+    def _event_starts_with_any_prefix(self, event: AstrMessageEvent) -> bool:
+        if not self.qq_block_prefixes:
+            return False
+        for prefix in self.qq_block_prefixes:
+            if self._event_starts_with_prefix(event, prefix):
+                return True
+        return False
 
     @staticmethod
     def _pick_file_name(file_data: dict) -> str:
@@ -917,7 +976,8 @@ class SowingDiscord(Star):
             f"- Telegram: {tg_status} (目标数: {target_count})\n"
             f"- Markdown归档: {archive_status}\n"
             f"- 归档目录: {self.archive_root}\n"
-            f"- 附件保存: {'开启' if self.archive_save_assets else '关闭'}"
+            f"- 附件保存: {'开启' if self.archive_save_assets else '关闭'}\n"
+            f"- 抑制前缀: {self.qq_block_prefixes or '未配置(已关闭)'}"
         )
 
     @filter.command("qq2tg_bind_target")
@@ -941,13 +1001,28 @@ class SowingDiscord(Star):
         group_id = event.message_obj.group_id
         msg_id = event.message_obj.message_id
         is_source = self._is_source_group(group_id)
+        group_key = self._group_state_key(group_id)
 
         logger.info(
             f"[QQ2TG][ID:{self.instance_id}] 收到 QQ 消息 id={msg_id}, group={group_id}, in_source={is_source}"
         )
 
+        if is_source and group_key:
+            if self._event_starts_with_any_prefix(event):
+                self._group_prefix_blocked.add(group_key)
+                logger.info(
+                    f"[QQ2TG] 群 {group_key} 命中抑制前缀 {self.qq_block_prefixes}，进入抑制转发状态。"
+                )
+            elif group_key in self._group_prefix_blocked:
+                self._group_prefix_blocked.discard(group_key)
+                logger.info(f"[QQ2TG] 群 {group_key} 收到非抑制前缀消息，恢复转发。")
+
         if is_source:
-            if self._is_queryable_message_id(msg_id):
+            if group_key in self._group_prefix_blocked:
+                logger.info(
+                    f"[QQ2TG] 群 {group_key} 处于抑制状态，跳过缓存消息: {msg_id}"
+                )
+            elif self._is_queryable_message_id(msg_id):
                 await self.local_cache.add_cache(msg_id, group_id=group_id)
             else:
                 logger.debug(f"[QQ2TG] 跳过不可查询消息ID: {msg_id}")

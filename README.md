@@ -14,6 +14,10 @@
 ## 配置项
 
 - `banshi_group_list`: QQ 来源群号列表
+- `qq_block_prefixes`: 抑制转发前缀列表（默认 `["!!"]`）
+  - 当某群出现以这些前缀开头的消息后，该群会进入抑制状态
+  - 抑制状态下后续消息（含图片/附件）都不会转发到 Telegram
+  - 直到该群出现一条不以这些前缀开头的消息，才恢复转发
 - `telegram_target_unified_origins`: Telegram 目标会话列表
   - 每项形如 `telegram:group_message:<chat_id>` 或 `telegram:private_message:<chat_id>`
 - `enable_telegram_forward`: 是否启用 Telegram 转发通道（默认 `true`）
@@ -46,6 +50,9 @@
 {
   "banshi_group_list": [
     "123456789"
+  ],
+  "qq_block_prefixes": [
+    "!!"
   ],
   "enable_telegram_forward": true,
   "enable_markdown_archive": true,

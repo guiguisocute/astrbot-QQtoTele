@@ -44,6 +44,13 @@
     "default": [],
     "description": "(兼容旧版) QQ 目标群列表。QQ->Telegram 转发不会使用此项"
   },
+  "qq_block_prefixes": {
+    "type": "list",
+    "default": [
+      "!!"
+    ],
+    "description": "QQ 抑制转发前缀列表。命中后该群进入抑制状态，直到出现一条不以这些前缀开头的消息"
+  },
   "telegram_target_unified_origins": {
     "type": "list",
     "default": [],
