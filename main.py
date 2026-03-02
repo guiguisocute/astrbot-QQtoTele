@@ -20,7 +20,7 @@ from .storage.local_cache import LocalCache
 from .storage.markdown_archive import MarkdownArchive
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.5")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.6")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -260,6 +260,42 @@ class SowingDiscord(Star):
                 return True
         return False
 
+    @staticmethod
+    def _normalize_leading_text(text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        return text.lstrip("\ufeff\u200b\u2060\u00a0\t\r\n ")
+
+    def _extract_plain_text_from_segments(self, msg_segments) -> str:
+        if not isinstance(msg_segments, list) or not msg_segments:
+            return ""
+
+        parts = []
+        for seg in msg_segments:
+            if not isinstance(seg, dict):
+                return ""
+
+            if seg.get("type") != "text":
+                return ""
+
+            data = seg.get("data") or {}
+            text_value = data.get("text")
+            if not isinstance(text_value, str):
+                return ""
+            parts.append(text_value)
+
+        normalized = self._normalize_leading_text("".join(parts))
+        return normalized
+
+    def _text_starts_with_any_prefix(self, text: str) -> bool:
+        normalized = self._normalize_leading_text(text)
+        if not normalized or not self.qq_block_prefixes:
+            return False
+        for prefix in self.qq_block_prefixes:
+            if normalized.startswith(prefix):
+                return True
+        return False
+
     def _extract_event_segments(self, event: AstrMessageEvent):
         msg_obj = getattr(event, "message_obj", None)
         if msg_obj is None:
@@ -277,35 +313,6 @@ class SowingDiscord(Star):
                     return segs
 
         return None
-
-    def _event_is_pure_text(self, event: AstrMessageEvent) -> bool:
-        segs = self._extract_event_segments(event)
-
-        if isinstance(segs, list) and segs:
-            text_seen = False
-            for seg in segs:
-                if isinstance(seg, dict):
-                    seg_type = seg.get("type")
-                    if seg_type != "text":
-                        return False
-                    data = seg.get("data") or {}
-                    text_value = data.get("text")
-                    if isinstance(text_value, str) and text_value.strip():
-                        text_seen = True
-                    continue
-
-                seg_type = getattr(seg, "type", None)
-                if seg_type and seg_type != "text":
-                    return False
-
-                text_value = getattr(seg, "text", None)
-                if isinstance(text_value, str) and text_value.strip():
-                    text_seen = True
-
-            return text_seen
-
-        text = self._extract_event_text(event)
-        return bool(text) and "[CQ:" not in text
 
     @staticmethod
     def _pick_file_name(file_data: dict) -> str:
@@ -1123,16 +1130,10 @@ class SowingDiscord(Star):
                     f"[QQ2TG] 群 {group_key} 命中抑制前缀 {self.qq_block_prefixes}，进入抑制转发状态。"
                 )
             elif group_key in self._group_prefix_blocked:
-                if self._event_is_pure_text(event):
-                    self._group_prefix_blocked.discard(group_key)
-                    logger.info(
-                        f"[QQ2TG] 群 {group_key} 收到非抑制前缀纯文本，恢复转发。"
-                    )
-                else:
-                    ignore_forward = True
-                    logger.info(
-                        f"[QQ2TG] 群 {group_key} 仍处于抑制状态，等待下一条非抑制前缀纯文本。"
-                    )
+                ignore_forward = True
+                logger.info(
+                    f"[QQ2TG] 群 {group_key} 仍处于抑制状态，等待下一条非抑制前缀纯文本。"
+                )
 
         if is_source:
             if self._is_queryable_message_id(msg_id):
@@ -1240,6 +1241,7 @@ class SowingDiscord(Star):
                             or cached_group_id
                             or sender_info.get("group_id")
                         )
+                        origin_group_key = self._group_state_key(origin_group_id)
                         origin_group_id_text = (
                             str(origin_group_id) if origin_group_id else "未知群号"
                         )
@@ -1287,6 +1289,19 @@ class SowingDiscord(Star):
                             logger.info(
                                 f"[QQ2TG] 群 {origin_group_id_text} 当前消息仅归档，跳过 Telegram: {msg_id}"
                             )
+
+                        if ignore_forward and origin_group_key:
+                            plain_text = self._extract_plain_text_from_segments(
+                                msg_content
+                            )
+                            if plain_text and not self._text_starts_with_any_prefix(
+                                plain_text
+                            ):
+                                self._group_prefix_blocked.discard(origin_group_key)
+                                ignore_forward = False
+                                logger.info(
+                                    f"[QQ2TG] 群 {origin_group_id_text} 命中解锁条件(非前缀纯文本)，本条起恢复 Telegram 转发。"
+                                )
 
                         for entry in entry_list:
                             if (
