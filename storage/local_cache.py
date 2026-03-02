@@ -26,16 +26,17 @@ class LocalCache:
     @staticmethod
     def _parse_cache_entry(entry):
         if isinstance(entry, (int, float)):
-            return float(entry), None
+            return float(entry), None, False
         if isinstance(entry, dict):
             ts_raw = entry.get("ts", entry.get("timestamp", 0))
             group_id = entry.get("group_id")
+            ignore_forward = bool(entry.get("ignore_forward", False))
             try:
                 ts = float(ts_raw)
             except (TypeError, ValueError):
                 ts = 0.0
-            return ts, group_id
-        return 0.0, None
+            return ts, group_id, ignore_forward
+        return 0.0, None, False
 
     async def _cleanup_expired_cache(self) -> int:
         """清理缓存中超过 MAX_CACHE_AGE_SECONDS 的消息，并返回清理数量。"""
@@ -53,7 +54,7 @@ class LocalCache:
 
             keys_to_keep = {}
             for message_id_str, entry in cache.items():
-                timestamp, group_id = self._parse_cache_entry(entry)
+                timestamp, group_id, ignore_forward = self._parse_cache_entry(entry)
                 if (
                     timestamp <= 0
                     or current_time - timestamp > self.MAX_CACHE_AGE_SECONDS
@@ -63,6 +64,7 @@ class LocalCache:
                     keys_to_keep[message_id_str] = {
                         "ts": timestamp,
                         "group_id": group_id,
+                        "ignore_forward": ignore_forward,
                     }
 
             if cleaned_count > 0:
@@ -71,7 +73,9 @@ class LocalCache:
 
             return cleaned_count
 
-    async def add_cache(self, message_id: int, group_id=None):
+    async def add_cache(
+        self, message_id: int, group_id=None, ignore_forward: bool = False
+    ):
         """添加一条message_id进入缓存, 保存时间"""
         str_message_id = str(message_id)
 
@@ -85,6 +89,7 @@ class LocalCache:
             cache[str_message_id] = {
                 "ts": time.time(),
                 "group_id": group_id,
+                "ignore_forward": bool(ignore_forward),
             }
 
             with open(self.cache_file, "w") as f:
@@ -105,7 +110,7 @@ class LocalCache:
                 return []
 
         for message_id_str, entry in cache.items():
-            timestamp, _ = self._parse_cache_entry(entry)
+            timestamp, _, _ = self._parse_cache_entry(entry)
             if current_time - timestamp > self.WAITING_TIME:
                 waiting_messages.append(message_id_str)
 
@@ -125,7 +130,7 @@ class LocalCache:
 
         timestamps = []
         for entry in cache.values():
-            ts, _ = self._parse_cache_entry(entry)
+            ts, _, _ = self._parse_cache_entry(entry)
             if ts > 0:
                 timestamps.append(ts)
         return min(timestamps) if timestamps else None
@@ -143,8 +148,24 @@ class LocalCache:
         if str_message_id not in cache:
             return None
 
-        _, group_id = self._parse_cache_entry(cache[str_message_id])
+        _, group_id, _ = self._parse_cache_entry(cache[str_message_id])
         return group_id
+
+    async def get_message_ignore_forward(self, message_id: int | str) -> bool:
+        str_message_id = str(message_id)
+
+        async with self._file_lock:
+            try:
+                with open(self.cache_file, "r") as f:
+                    cache = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                return False
+
+        if str_message_id not in cache:
+            return False
+
+        _, _, ignore_forward = self._parse_cache_entry(cache[str_message_id])
+        return ignore_forward
 
     async def has_pending_messages(self) -> bool:
         """检查缓存中是否还有消息（无论是否成熟）"""

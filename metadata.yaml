@@ -1,6 +1,6 @@
 name: astrbot_qq_to_telegram
 desc: QQ 源群消息转发到 Telegram，并可本地归档为 Markdown
 help: 支持 Telegram 转发与 Markdown 本地归档双通道输出
-version: 1.1.4
+version: 1.1.5
 author: guiguisocute
 repo: https://github.com/guiguisocute/astrbot-QQtoTele

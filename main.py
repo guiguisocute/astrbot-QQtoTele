@@ -20,7 +20,7 @@ from .storage.local_cache import LocalCache
 from .storage.markdown_archive import MarkdownArchive
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.4")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.5")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -259,6 +259,53 @@ class SowingDiscord(Star):
             if self._event_starts_with_prefix(event, prefix):
                 return True
         return False
+
+    def _extract_event_segments(self, event: AstrMessageEvent):
+        msg_obj = getattr(event, "message_obj", None)
+        if msg_obj is None:
+            return None
+
+        for attr in ("message", "messages", "content"):
+            segs = getattr(msg_obj, attr, None)
+            if isinstance(segs, list):
+                return segs
+
+        if isinstance(msg_obj, dict):
+            for key in ("message", "messages", "content"):
+                segs = msg_obj.get(key)
+                if isinstance(segs, list):
+                    return segs
+
+        return None
+
+    def _event_is_pure_text(self, event: AstrMessageEvent) -> bool:
+        segs = self._extract_event_segments(event)
+
+        if isinstance(segs, list) and segs:
+            text_seen = False
+            for seg in segs:
+                if isinstance(seg, dict):
+                    seg_type = seg.get("type")
+                    if seg_type != "text":
+                        return False
+                    data = seg.get("data") or {}
+                    text_value = data.get("text")
+                    if isinstance(text_value, str) and text_value.strip():
+                        text_seen = True
+                    continue
+
+                seg_type = getattr(seg, "type", None)
+                if seg_type and seg_type != "text":
+                    return False
+
+                text_value = getattr(seg, "text", None)
+                if isinstance(text_value, str) and text_value.strip():
+                    text_seen = True
+
+            return text_seen
+
+        text = self._extract_event_text(event)
+        return bool(text) and "[CQ:" not in text
 
     @staticmethod
     def _pick_file_name(file_data: dict) -> str:
@@ -886,6 +933,7 @@ class SowingDiscord(Star):
         msg_time_str: str,
         day_str: str,
         message_id,
+        ignored: bool = False,
         client=None,
     ) -> str:
         if not isinstance(msg_content, list):
@@ -997,8 +1045,12 @@ class SowingDiscord(Star):
 
         body = " ".join([x for x in text_parts if x]).strip() or "[空消息]"
 
+        heading = f"## {self._md_inline(msg_time_str)}"
+        if ignored:
+            heading = f"## [ignore] {self._md_inline(msg_time_str)}"
+
         lines = [
-            f"## {self._md_inline(msg_time_str)}",
+            heading,
             f"- 来源群: `{self._md_inline(source_group_name)}` (`{self._md_inline(source_group_id)}`)",
             f"- 发送者: `{self._md_inline(sender_name)}` (`{self._md_inline(sender_id)}`)",
             f"- 消息ID: `{self._md_inline(message_id)}`",
@@ -1061,23 +1113,38 @@ class SowingDiscord(Star):
             f"[QQ2TG][ID:{self.instance_id}] 收到 QQ 消息 id={msg_id}, group={group_id}, in_source={is_source}"
         )
 
+        ignore_forward = False
         if is_source and group_key:
-            if self._event_starts_with_any_prefix(event):
+            hit_prefix = self._event_starts_with_any_prefix(event)
+            if hit_prefix:
                 self._group_prefix_blocked.add(group_key)
+                ignore_forward = True
                 logger.info(
                     f"[QQ2TG] 群 {group_key} 命中抑制前缀 {self.qq_block_prefixes}，进入抑制转发状态。"
                 )
             elif group_key in self._group_prefix_blocked:
-                self._group_prefix_blocked.discard(group_key)
-                logger.info(f"[QQ2TG] 群 {group_key} 收到非抑制前缀消息，恢复转发。")
+                if self._event_is_pure_text(event):
+                    self._group_prefix_blocked.discard(group_key)
+                    logger.info(
+                        f"[QQ2TG] 群 {group_key} 收到非抑制前缀纯文本，恢复转发。"
+                    )
+                else:
+                    ignore_forward = True
+                    logger.info(
+                        f"[QQ2TG] 群 {group_key} 仍处于抑制状态，等待下一条非抑制前缀纯文本。"
+                    )
 
         if is_source:
-            if group_key in self._group_prefix_blocked:
-                logger.info(
-                    f"[QQ2TG] 群 {group_key} 处于抑制状态，跳过缓存消息: {msg_id}"
+            if self._is_queryable_message_id(msg_id):
+                await self.local_cache.add_cache(
+                    msg_id,
+                    group_id=group_id,
+                    ignore_forward=ignore_forward,
                 )
-            elif self._is_queryable_message_id(msg_id):
-                await self.local_cache.add_cache(msg_id, group_id=group_id)
+                if ignore_forward:
+                    logger.info(
+                        f"[QQ2TG] 群 {group_key} 处于抑制状态，消息仅归档不转发: {msg_id}"
+                    )
             else:
                 logger.debug(f"[QQ2TG] 跳过不可查询消息ID: {msg_id}")
 
@@ -1165,6 +1232,9 @@ class SowingDiscord(Star):
                         cached_group_id = await self.local_cache.get_message_group_id(
                             msg_id
                         )
+                        ignore_forward = (
+                            await self.local_cache.get_message_ignore_forward(msg_id)
+                        )
                         origin_group_id = (
                             msg_detail.get("group_id")
                             or cached_group_id
@@ -1213,10 +1283,16 @@ class SowingDiscord(Star):
                             if archive_skip:
                                 logger.info(f"[QQ2TG][Archive] 去重跳过: {archive_key}")
 
+                        if ignore_forward:
+                            logger.info(
+                                f"[QQ2TG] 群 {origin_group_id_text} 当前消息仅归档，跳过 Telegram: {msg_id}"
+                            )
+
                         for entry in entry_list:
                             if (
                                 self.enable_telegram_forward
                                 and self.telegram_target_unified_origins
+                                and not ignore_forward
                             ):
                                 chains, temp_files = await self._build_forward_chain(
                                     msg_content=entry["msg_content"],
@@ -1268,6 +1344,7 @@ class SowingDiscord(Star):
                                         msg_time_str=entry["msg_time_str"],
                                         day_str=day_str,
                                         message_id=msg_id,
+                                        ignored=ignore_forward,
                                         client=client,
                                     )
                                     archive_target_file = (
