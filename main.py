@@ -20,7 +20,7 @@ from .storage.local_cache import LocalCache
 from .storage.markdown_archive import MarkdownArchive
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.2")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.4")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -170,25 +170,58 @@ class SowingDiscord(Star):
             text = str(group_id_raw).strip()
             return text
 
-    def _event_starts_with_prefix(self, event: AstrMessageEvent, prefix: str) -> bool:
-        if not prefix:
-            return False
-
+    def _extract_event_text(self, event: AstrMessageEvent) -> str:
         msg_obj = getattr(event, "message_obj", None)
         raw_text = ""
 
+        def _render_segments(segs) -> str:
+            if not isinstance(segs, list):
+                return ""
+
+            parts = []
+            for seg in segs:
+                if isinstance(seg, dict):
+                    seg_type = seg.get("type")
+                    data = seg.get("data") or {}
+                    if seg_type == "text" and isinstance(data, dict):
+                        txt = data.get("text")
+                        if isinstance(txt, str):
+                            parts.append(txt)
+                    elif isinstance(seg.get("text"), str):
+                        parts.append(seg.get("text"))
+                    continue
+
+                text_val = getattr(seg, "text", None)
+                if isinstance(text_val, str):
+                    parts.append(text_val)
+
+            return "".join(parts)
+
         if msg_obj is not None:
-            for attr in ("message", "messages", "content"):
-                segs = getattr(msg_obj, attr, None)
-                if isinstance(segs, list):
-                    raw_text = self._render_message_text(segs)
+            for attr in ("raw_message", "message_str", "text"):
+                value = getattr(msg_obj, attr, None)
+                if isinstance(value, str) and value:
+                    raw_text = value
                     break
 
-            if not raw_text:
-                for attr in ("raw_message", "message_str", "text"):
-                    value = getattr(msg_obj, attr, None)
+            if not raw_text and isinstance(msg_obj, dict):
+                for key in ("raw_message", "message_str", "text"):
+                    value = msg_obj.get(key)
                     if isinstance(value, str) and value:
                         raw_text = value
+                        break
+
+            if not raw_text:
+                for attr in ("message", "messages", "content"):
+                    segs = getattr(msg_obj, attr, None)
+                    raw_text = _render_segments(segs)
+                    if raw_text:
+                        break
+
+            if not raw_text and isinstance(msg_obj, dict):
+                for key in ("message", "messages", "content"):
+                    raw_text = _render_segments(msg_obj.get(key))
+                    if raw_text:
                         break
 
         if not raw_text:
@@ -196,7 +229,28 @@ class SowingDiscord(Star):
             if isinstance(event_msg_str, str):
                 raw_text = event_msg_str
 
-        return isinstance(raw_text, str) and raw_text.startswith(prefix)
+        get_msg_str = getattr(event, "get_message_str", None)
+        if not raw_text and callable(get_msg_str):
+            try:
+                candidate = get_msg_str()
+                if isinstance(candidate, str):
+                    raw_text = candidate
+            except Exception:
+                pass
+
+        if not isinstance(raw_text, str):
+            return ""
+
+        normalized = raw_text.lstrip("\ufeff\u200b\u2060\u00a0\t\r\n ")
+        normalized = re.sub(r"^(?:\[CQ:[^\]]+\])+", "", normalized).lstrip()
+        return normalized
+
+    def _event_starts_with_prefix(self, event: AstrMessageEvent, prefix: str) -> bool:
+        if not prefix:
+            return False
+
+        raw_text = self._extract_event_text(event)
+        return raw_text.startswith(prefix)
 
     def _event_starts_with_any_prefix(self, event: AstrMessageEvent) -> bool:
         if not self.qq_block_prefixes:
