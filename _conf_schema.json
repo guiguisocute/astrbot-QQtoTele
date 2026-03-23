@@ -51,15 +51,25 @@
     ],
     "description": "QQ 抑制转发前缀列表。命中后该群进入抑制状态，直到出现一条不以这些前缀开头的消息"
   },
-  "telegram_target_unified_origins": {
+  "enable_discord_forward": {
+    "type": "bool",
+    "default": true,
+    "description": "是否启用 Discord 转发通道"
+  },
+  "discord_target_unified_origins": {
     "type": "list",
     "default": [],
-    "description": "Telegram 目标会话列表。每项形如 telegram:group_message:<chat_id> 或 telegram:private_message:<chat_id>"
+    "description": "Discord 目标会话列表。请在 Discord 目标频道发送 /qq2dc_bind_target 获取 ID 并填入"
   },
   "enable_telegram_forward": {
     "type": "bool",
     "default": true,
     "description": "是否启用 Telegram 转发通道"
+  },
+  "telegram_target_unified_origins": {
+    "type": "list",
+    "default": [],
+    "description": "Telegram 目标会话列表。每项形如 telegram:group_message:<chat_id>"
   },
   "enable_markdown_archive": {
     "type": "bool",
