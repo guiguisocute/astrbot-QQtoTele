@@ -55,6 +55,11 @@ class SowingDiscord(Star):
         self.telegram_target_unified_origins = self._normalize_str_list(
             config.get("telegram_target_unified_origins")
         )
+        # --- Discord 目标配置 ---
+        self.enable_discord_forward = bool(config.get("enable_discord_forward", True))
+        self.discord_target_unified_origins = self._normalize_str_list(
+            config.get("discord_target_unified_origins")
+        )
 
         self.block_source_messages = bool(config.get("block_source_messages", False))
         self.banshi_waiting_time = int(config.get("banshi_waiting_time", 1))
@@ -1109,6 +1114,27 @@ class SowingDiscord(Star):
             f"请把下面这一项写入插件配置 telegram_target_unified_origins:\n{umo}"
         )
 
+    @filter.command("qq2dc_bind_target")
+    async def qq2dc_bind_target(self, event: AstrMessageEvent):
+        platform = event.get_platform_name()
+        if platform != "discord":
+            yield event.plain_result("❌ 请在 Discord 目标频道中执行此命令。")
+            return
+
+        umo = event.unified_msg_origin
+        
+        # 容错处理：如果你还没在 __init__ 里加上这行，防止报错
+        if not hasattr(self, 'discord_target_unified_origins'):
+            self.discord_target_unified_origins = []
+            
+        if umo not in self.discord_target_unified_origins:
+            self.discord_target_unified_origins.append(umo)
+
+        yield event.plain_result(
+            "✅ 已绑定当前 Discord 会话为转发目标(仅本次运行生效)。\n"
+            f"请把下面这一项写入插件配置 discord_target_unified_origins:\n{umo}"
+        )
+        
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     async def handle_message(self, event: AstrMessageEvent):
         group_id = event.message_obj.group_id
@@ -1304,11 +1330,18 @@ class SowingDiscord(Star):
                                 )
 
                         for entry in entry_list:
-                            if (
-                                self.enable_telegram_forward
-                                and self.telegram_target_unified_origins
-                                and not ignore_forward
-                            ):
+                            # 1. 收集所有的目标频道 ID
+                            all_targets = []
+                            # 2. 如果 TG 开关打开了，把 TG 的频道 ID 塞进去
+                            if self.enable_telegram_forward:
+                                all_targets.extend(self.telegram_target_unified_origins)
+                            # 3. 如果 DC 开关打开了，把 DC 的频道 ID 塞进去
+                            if getattr(self, 'enable_discord_forward', False):
+                                all_targets.extend(self.discord_target_unified_origins)
+
+                            # --- 开始发送逻辑 ---
+                            # 2. 如果目标池不为空，且这条消息允许被转发
+                            if all_targets and not ignore_forward:
                                 chains, temp_files = await self._build_forward_chain(
                                     msg_content=entry["msg_content"],
                                     source_group_name=source_group_name,
@@ -1320,22 +1353,18 @@ class SowingDiscord(Star):
                                     client=client,
                                 )
 
-                                for target_umo in self.telegram_target_unified_origins:
+                                # 3. 遍历目标池统一发送
+                                for target_umo in all_targets:
                                     try:
                                         message_chain = MessageChain()
                                         message_chain.chain = list(chains)
-                                        await self.context.send_message(
-                                            target_umo, message_chain
-                                        )
-                                        logger.info(
-                                            f"[QQ2TG] 转发成功: msg={msg_id} -> {target_umo}"
-                                        )
+                                        await self.context.send_message(target_umo, message_chain)
+                                        logger.info(f"[QQ2Multi] 转发成功: msg={msg_id} -> {target_umo}")
                                     except Exception as exc:
-                                        logger.error(
-                                            f"[QQ2TG] 转发失败: msg={msg_id} -> {target_umo}, error={exc}"
-                                        )
+                                        logger.error(f"[QQ2Multi] 转发失败: msg={msg_id} -> {target_umo}, error={exc}")
                                     await asyncio.sleep(0.2)
 
+                                # 4. 发送完毕后，清理下载的图片/文件垃圾
                                 for temp_path in temp_files:
                                     try:
                                         if temp_path and os.path.exists(temp_path):
