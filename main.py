@@ -20,7 +20,7 @@ from .storage.local_cache import LocalCache
 from .storage.markdown_archive import MarkdownArchive
 
 
-@register("astrbot_qq_to_telegram", "guiguisocute", "QQ -> Telegram 搬运插件", "1.1.6")
+@register("astrbot_qq_to_telegram", "guiguisocute", "QQ 本地归档与多平台转发插件", "1.1.6")
 class SowingDiscord(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -811,7 +811,7 @@ class SowingDiscord(Star):
         safe_time = self._escape_markdown(str(msg_time_str))
 
         header_markdown = (
-            "*QQ -> Telegram 转发*\n"
+            "*QQ 消息转发*\n"
             f"*来源群*: `{safe_group}` (`{safe_group_id}`)\n"
             f"*发送者*: `{safe_sender}` (`{safe_sender_id}`)\n"
             f"*时间*: `{safe_time}`\n"
@@ -1122,11 +1122,11 @@ class SowingDiscord(Star):
             return
 
         umo = event.unified_msg_origin
-        
+
         # 容错处理：如果你还没在 __init__ 里加上这行，防止报错
-        if not hasattr(self, 'discord_target_unified_origins'):
+        if not hasattr(self, "discord_target_unified_origins"):
             self.discord_target_unified_origins = []
-            
+
         if umo not in self.discord_target_unified_origins:
             self.discord_target_unified_origins.append(umo)
 
@@ -1134,7 +1134,7 @@ class SowingDiscord(Star):
             "✅ 已绑定当前 Discord 会话为转发目标(仅本次运行生效)。\n"
             f"请把下面这一项写入插件配置 discord_target_unified_origins:\n{umo}"
         )
-        
+
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     async def handle_message(self, event: AstrMessageEvent):
         group_id = event.message_obj.group_id
@@ -1336,7 +1336,7 @@ class SowingDiscord(Star):
                             if self.enable_telegram_forward:
                                 all_targets.extend(self.telegram_target_unified_origins)
                             # 3. 如果 DC 开关打开了，把 DC 的频道 ID 塞进去
-                            if getattr(self, 'enable_discord_forward', False):
+                            if getattr(self, "enable_discord_forward", False):
                                 all_targets.extend(self.discord_target_unified_origins)
 
                             # --- 开始发送逻辑 ---
@@ -1358,10 +1358,16 @@ class SowingDiscord(Star):
                                     try:
                                         message_chain = MessageChain()
                                         message_chain.chain = list(chains)
-                                        await self.context.send_message(target_umo, message_chain)
-                                        logger.info(f"[QQ2Multi] 转发成功: msg={msg_id} -> {target_umo}")
+                                        await self.context.send_message(
+                                            target_umo, message_chain
+                                        )
+                                        logger.info(
+                                            f"[QQ2Multi] 转发成功: msg={msg_id} -> {target_umo}"
+                                        )
                                     except Exception as exc:
-                                        logger.error(f"[QQ2Multi] 转发失败: msg={msg_id} -> {target_umo}, error={exc}")
+                                        logger.error(
+                                            f"[QQ2Multi] 转发失败: msg={msg_id} -> {target_umo}, error={exc}"
+                                        )
                                     await asyncio.sleep(0.2)
 
                                 # 4. 发送完毕后，清理下载的图片/文件垃圾

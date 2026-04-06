@@ -58,3 +58,4 @@ coverage.xml
 # Ignore local runtime or cache directories if any
 runtime/
 cache/
+.spec-workflow/
